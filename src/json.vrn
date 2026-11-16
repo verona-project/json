@@ -1,0 +1,306 @@
+(import base)
+(import allocator)
+(import data :as d)
+(import error :as e)
+(import string :as s)
+
+; Widen character literals explicitly for u64 comparisons and arithmetic.
+(base:function char-code ((character u8)) u64
+  (base:convert character))
+
+(base:type result (product (status e:status) (offset u64)))
+
+; EOF is distinct from every possible input byte.
+(base:constant end-of-input u64 256)
+
+(base:function byte-at ((source d:view) (at u64)) u64
+  (match (< at (field source length))
+    (true (base:convert (deref (pointer-offset (field source bytes) at))))
+    (false end-of-input)))
+
+(base:function span ((source d:view) (start u64) (end u64)) d:view
+  (d:view (pointer-offset (field source bytes) start) (- end start)))
+
+; String and key spans include their quotes and retain JSON escapes.
+(base:type token
+  (sum
+    (null)
+    (boolean)
+    (number)
+    (string)
+    (key)
+    (begin-array)
+    (end-array)
+    (begin-object)
+    (end-object)))
+
+(base:type visitor
+  (product (context (pointer void)) (emit (pointer (function ((pointer void) token d:view) unit)))))
+
+(base:function emit ((sink visitor) (kind token) (source d:view) (start u64) (end u64)) unit
+  (let ((f (pointer (function ((pointer void) token d:view) unit)) (field sink emit)))
+    (f (field sink context) kind (span source start end))))
+
+(base:function space ((c u64)) bool
+  (base:or
+    (== c (char-code #\space))
+    (== c (char-code #\tab))
+    (== c (char-code #\newline))
+    (== c (char-code #\return))))
+
+(base:function skip ((source d:view) (at u64)) u64
+  (match (space (byte-at source at)) (true (skip source (+ at 1))) (false at)))
+
+(base:function digit ((c u64)) bool
+  (base:and (>= c (char-code #\0)) (<= c (char-code #\9))))
+
+(base:function digits ((source d:view) (at u64)) u64
+  (match (digit (byte-at source at)) (true (digits source (+ at 1))) (false at)))
+
+(base:function hex ((c u64)) u64
+  (base:cond
+    ((base:and (>= c (char-code #\0)) (<= c (char-code #\9))) (- c (char-code #\0)))
+    ((base:and (>= c (char-code #\A)) (<= c (char-code #\F))) (+ (- c (char-code #\A)) 10))
+    ((base:and (>= c (char-code #\a)) (<= c (char-code #\f))) (+ (- c (char-code #\a)) 10))
+    (true 65536)))
+
+(base:function hex4 ((source d:view) (at u64) (remaining u64) (value u64)) (tuple bool u64)
+  (match (== remaining 0)
+    (true (tuple true value))
+    (false
+      (let ((h u64 (hex (byte-at source at))))
+        (match (== h 65536)
+          (true (tuple false at))
+          (false (hex4 source (+ at 1) (- remaining 1) (+ (* value 16) h))))))))
+
+(base:function string-tail ((source d:view) (at u64)) (tuple bool u64)
+  (let ((c u64 (byte-at source at)))
+    (base:cond
+      ((== c (char-code #\")) (tuple true (+ at 1)))
+      ((base:or (< c (char-code #\space)) (== c end-of-input)) (tuple false at))
+      ((== c (char-code #\\))
+       (let ((escape u64 (byte-at source (+ at 1))))
+         (base:cond
+           ((base:or
+              (== escape (char-code #\"))
+              (== escape (char-code #\\))
+              (== escape (char-code #\/))
+              (== escape (char-code #\b))
+              (== escape (char-code #\f))
+              (== escape (char-code #\n))
+              (== escape (char-code #\r))
+              (== escape (char-code #\t)))
+            (string-tail source (+ at 2)))
+           ((== escape (char-code #\u))
+            (match (hex4 source (+ at 2) 4 0)
+              ((tuple false where) (tuple false where))
+              ((tuple valid scalar)
+               (base:cond
+                 ((base:and (>= scalar 56320) (<= scalar 57343)) (tuple false at))
+                 ((base:and (>= scalar 55296) (<= scalar 56319))
+                  (match
+                    (base:and
+                      (== (byte-at source (+ at 6)) (char-code #\\))
+                      (== (byte-at source (+ at 7)) (char-code #\u)))
+                    (false (tuple false (+ at 6)))
+                    (true
+                      (match (hex4 source (+ at 8) 4 0)
+                        ((tuple false where) (tuple false where))
+                        ((tuple valid low)
+                         (match (base:and (>= low 56320) (<= low 57343))
+                           (true (string-tail source (+ at 12)))
+                           (false (tuple false (+ at 8)))))))))
+                 (true (string-tail source (+ at 6)))))))
+           (true (tuple false (+ at 1))))))
+      (true (string-tail source (+ at 1))))))
+
+(base:function exponent ((source d:view) (at u64)) (tuple bool u64)
+  (match (base:or (== (byte-at source at) (char-code #\e)) (== (byte-at source at) (char-code #\E)))
+    (false (tuple true at))
+    (true
+      (let
+        ((sign u64 (+ at 1))
+         (start
+           u64
+           (match
+             (base:or
+               (== (byte-at source sign) (char-code #\+))
+               (== (byte-at source sign) (char-code #\-)))
+             (true (+ sign 1))
+             (false sign))))
+        (match (digit (byte-at source start))
+          (false (tuple false start))
+          (true (tuple true (digits source start))))))))
+
+(base:function fraction ((source d:view) (at u64)) (tuple bool u64)
+  (match (== (byte-at source at) (char-code #\.))
+    (false (exponent source at))
+    (true
+      (match (digit (byte-at source (+ at 1)))
+        (false (tuple false (+ at 1)))
+        (true (exponent source (digits source (+ at 1))))))))
+
+(base:function number-end ((source d:view) (at u64)) (tuple bool u64)
+  (let
+    ((start u64 (match (== (byte-at source at) (char-code #\-)) (true (+ at 1)) (false at)))
+     (c u64 (byte-at source start)))
+    (base:cond
+      ((== c (char-code #\0)) (fraction source (+ start 1)))
+      ((base:and (>= c (char-code #\1)) (<= c (char-code #\9)))
+       (fraction source (digits source start)))
+      (true (tuple false start)))))
+
+(base:function literal ((source d:view) (at u64) (text d:view) (i u64)) (tuple bool u64)
+  (match (== i (field text length))
+    (true (tuple true (+ at i)))
+    (false
+      (match (== (byte-at source (+ at i)) (byte-at text i))
+        (true (literal source at text (+ i 1)))
+        (false (tuple false (+ at i)))))))
+
+(base:function scalar ((source d:view) (at u64) (sink visitor)) (tuple bool u64)
+  (let
+    ((c u64 (byte-at source at))
+     (kind
+       token
+       (base:cond
+         ((== c (char-code #\")) (string))
+         ((== c (char-code #\n)) (null))
+         ((base:or (== c (char-code #\t)) (== c (char-code #\f))) (boolean))
+         (true (number))))
+     (end
+       (tuple bool u64)
+       (base:cond
+         ((== c (char-code #\")) (string-tail source (+ at 1)))
+         ((== c (char-code #\n)) (literal source at (d:view "null" 4) 0))
+         ((== c (char-code #\t)) (literal source at (d:view "true" 4) 0))
+         ((== c (char-code #\f)) (literal source at (d:view "false" 5) 0))
+         (true (number-end source at)))))
+    (match end
+      ((tuple false where) (tuple false where))
+      ((tuple valid where) (do (emit sink kind source at where) end)))))
+
+; Remaining depth bounds adversarial nesting without imposing a numeric range.
+(base:function value-at ((source d:view) (at u64) (depth u64) (sink visitor)) (tuple bool u64)
+  (let ((start u64 (skip source at)) (c u64 (byte-at source start)))
+    (match (base:or (== c (char-code #\[)) (== c (char-code #\{)))
+      (false (scalar source start sink))
+      (true
+        (match (== depth 0)
+          (true (tuple false start))
+          (false
+            (do
+              (emit
+                sink
+                (match (== c (char-code #\[)) (true (begin-array)) (false (begin-object)))
+                source
+                start
+                (+ start 1))
+              (members
+                source
+                (skip source (+ start 1))
+                (- depth 1)
+                sink
+                (== c (char-code #\{))
+                true))))))))
+
+(base:function members
+  ((source d:view) (at u64) (depth u64) (sink visitor) (object bool) (first bool)) (tuple bool u64)
+  (let ((close u64 (match object (true (char-code #\})) (false (char-code #\])))))
+    (match (base:and first (== (byte-at source at) close))
+      (true
+        (do
+          (emit sink (match object (true (end-object)) (false (end-array))) source at (+ at 1))
+          (tuple true (+ at 1))))
+      (false
+        (let
+          ((start
+             (tuple bool u64)
+             (match object
+               (false (tuple true at))
+               (true
+                 (match (== (byte-at source at) (char-code #\"))
+                   (false (tuple false at))
+                   (true
+                     (match (string-tail source (+ at 1))
+                       ((tuple false where) (tuple false where))
+                       ((tuple valid end)
+                        (let ((colon u64 (skip source end)))
+                          (match (== (byte-at source colon) (char-code #\:))
+                            (false (tuple false colon))
+                            (true (do (emit sink (key) source at end) (tuple true (+ colon 1))))))))))))))
+          (match start
+            ((tuple false where) (tuple false where))
+            ((tuple valid where)
+             (match (value-at source where depth sink)
+               ((tuple false failed) (tuple false failed))
+               ((tuple valid end)
+                (let ((next u64 (skip source end)) (c u64 (byte-at source next)))
+                  (base:cond
+                    ((== c close)
+                     (do
+                       (emit
+                         sink
+                         (match object (true (end-object)) (false (end-array)))
+                         source
+                         next
+                         (+ next 1))
+                       (tuple true (+ next 1))))
+                    ((== c (char-code #\,))
+                     (members source (skip source (+ next 1)) depth sink object false))
+                    (true (tuple false next)))))))))))))
+
+;; Parse one complete UTF-8 JSON document; callbacks may precede a later error.
+(base:function parse ((source d:view) (sink visitor)) result
+  (match (s:validate source)
+    ((tuple false _) (result (e:invalid) 0))
+    ((tuple valid _)
+     (match (value-at source 0 128 sink)
+       ((tuple false where) (result (e:invalid) where))
+       ((tuple valid end)
+        (let ((tail u64 (skip source end)))
+          (match (== tail (field source length))
+            (true (result (e:success) tail))
+            (false (result (e:invalid) tail)))))))))
+
+; Append a quoted JSON string. Reserve first so allocation failure preserves OUT.
+(base:function quote-at ((source d:view) (at u64) (out (pointer d:data))) unit
+  (match (== at (field source length))
+    (true (do (d:append out #\") unit))
+    (false
+      (let ((c u64 (byte-at source at)) (byte u8 (base:convert c)))
+        (do
+          (base:cond
+            ((base:or (== c (char-code #\")) (== c (char-code #\\)))
+             (do (d:append out #\\) (d:append out byte) unit))
+            ((< c (char-code #\space))
+             (let ((hexes (pointer u8) "0123456789abcdef"))
+               (do
+                 (d:append out #\\)
+                 (d:append out #\u)
+                 (d:append out #\0)
+                 (d:append out #\0)
+                 (d:append out (deref (pointer-offset hexes (/ c 16))))
+                 (d:append out (deref (pointer-offset hexes (- c (* (/ c 16) 16)))))
+                 unit)))
+            (true (do (d:append out byte) unit)))
+          (quote-at source (+ at 1) out))))))
+
+(base:function write-string ((source d:view) (out (pointer d:data))) e:status
+  (match (s:validate source)
+    ((tuple false _) (e:invalid))
+    ((tuple valid _)
+     (match (allocator:checked-multiply-size (field source length) 6)
+       ((tuple false _) (e:too-large))
+       ((tuple valid size)
+        (match (allocator:checked-add-size size 2)
+          ((tuple false _) (e:too-large))
+          ((tuple valid quoted)
+           (match (allocator:checked-add-size (d:length (deref out)) quoted)
+             ((tuple false _) (e:too-large))
+             ((tuple valid capacity)
+              (match (d:reserve out capacity)
+                ((ok) (do (d:append out #\") (quote-at source 0 out) (e:success)))
+                (reason reason)))))))))))
+
+(export result token visitor parse write-string)

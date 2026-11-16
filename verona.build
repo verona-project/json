@@ -1,0 +1,9 @@
+(static-library json
+  (version "0.1.0") (root json)
+  (module-path "src") (module-path "../base/src")
+  (module-path "../foundation/src") (optimize 2))
+
+(executable json-tests
+  (root json.tests) (module-path "src") (module-path "tests")
+  (module-path "../base/src") (module-path "../foundation/src")
+  (module-path "../testing/src") (optimize 2))

@@ -1,0 +1,369 @@
+(import base)
+(import testing)
+(import testing :as t)
+(import allocator :as a)
+(import system_allocator :as system)
+(import arena)
+(import data :as d)
+(import error :as e)
+
+; Widen character literals explicitly for u64 comparisons and arithmetic.
+(base:function char-code ((character u8)) u64
+  (base:convert character))
+
+(base:variable budget u64 1000000)
+
+(base:variable live u64 0)
+
+(base:function acquire ((context (pointer void)) (size u64) (alignment u64)) a:result
+  (match (== budget 0)
+    (true (a:failure (out-of-memory)))
+    (false
+      (do
+        (assign budget (- budget 1))
+        (match (a:allocate (system:create) size alignment)
+          ((failed reason) (a:failure reason))
+          ((allocated p) (do (assign live (+ live 1)) (a:success p))))))))
+
+(base:function release ((context (pointer void)) (p (pointer u8)) (size u64) (alignment u64)) unit
+  (do (assign live (- live 1)) (a:deallocate (system:create) p size alignment)))
+
+(base:function backend () a:backend
+  (a:backend (cast (pointer void) "") acquire release))
+
+(base:function ok ((status e:status)) bool
+  (match status ((ok) true) (_ false)))
+
+(base:function append ((out (pointer d:data)) (source d:view) (at u64)) unit
+  (match (== at (field source length))
+    (true (do (d:append out #\|) unit))
+    (false
+      (do
+        (d:append out (deref (pointer-offset (field source bytes) at)))
+        (append out source (+ at 1))))))
+
+(import json :as f)
+
+(base:function emit ((context (pointer void)) (kind f:token) (value d:view)) unit
+  (append (cast (pointer d:data) context) value 0))
+
+(base:function check-parse ((source d:view) (valid bool) (expected d:view)) t:result
+  (let
+    ((captured d:data (d:empty (system:create)))
+     (parsed f:result (f:parse source (f:visitor (cast (pointer void) (address-of captured)) emit)))
+     (checks
+       t:result
+       (t:checks
+         (t:check
+           (match valid
+             (true (ok (field parsed status)))
+             (false (base:not (ok (field parsed status))))))
+         (match valid (true (t:check (d:equal (d:borrow captured) expected))) (false (t:empty)))
+         (t:check
+           (match valid
+             (true (== (field parsed offset) (field source length)))
+             (false (<= (field parsed offset) (field source length))))))))
+    (do (d:destroy (address-of captured)) checks)))
+
+(t:test valid-null
+  (check-parse (d:view "null" 4) true (d:view "null|" 5)))
+
+(t:test valid-whitespace
+  (let ((fixture-0 (array u8 8) (array-of #\space #\t #\r #\u #\e #\space #\return #\newline)))
+    (check-parse (d:view (address-of (index fixture-0 0)) 8) true (d:view "true|" 5))))
+
+(t:test valid-false-literal
+  (check-parse (d:view "false" 5) true (d:view "false|" 6)))
+
+(t:test valid-large-number-lexeme
+  (check-parse
+    (d:view "123456789012345678901234567890" 30)
+    true
+    (d:view "123456789012345678901234567890|" 31)))
+
+(t:test valid-fraction-exponent
+  (check-parse (d:view "-0.25e+10" 9) true (d:view "-0.25e+10|" 10)))
+
+(t:test valid-empty-array
+  (check-parse (d:view "[]" 2) true (d:view "[|]|" 4)))
+
+(t:test valid-empty-object
+  (check-parse (d:view "{}" 2) true (d:view "{|}|" 4)))
+
+(t:test valid-nested-object-unicode
+  (let
+    ((fixture-1
+       (array u8 28)
+       (array-of
+         #\{
+         #\"
+         #\a
+         #\"
+         #\:
+         #\[
+         #\n
+         #\u
+         #\l
+         #\l
+         #\,
+         #\t
+         #\r
+         #\u
+         #\e
+         #\,
+         #\3
+         #\]
+         #\,
+         #\"
+         #\x
+         #\"
+         #\:
+         #\"
+         195
+         169
+         #\"
+         #\}))
+     (fixture-2
+       (array u8 33)
+       (array-of
+         #\{
+         #\|
+         #\"
+         #\a
+         #\"
+         #\|
+         #\[
+         #\|
+         #\n
+         #\u
+         #\l
+         #\l
+         #\|
+         #\t
+         #\r
+         #\u
+         #\e
+         #\|
+         #\3
+         #\|
+         #\]
+         #\|
+         #\"
+         #\x
+         #\"
+         #\|
+         #\"
+         195
+         169
+         #\"
+         #\|
+         #\}
+         #\|)))
+    (check-parse
+      (d:view (address-of (index fixture-1 0)) 28)
+      true
+      (d:view (address-of (index fixture-2 0)) 33))))
+
+(t:test valid-surrogate-pair
+  (check-parse (d:view "\"\\uD834\\uDD1E\"" 14) true (d:view "\"\\uD834\\uDD1E\"|" 15)))
+
+(t:test valid-all-escapes
+  (check-parse
+    (d:view "\"\\n\\t\\b\\f\\r\\/\\\\\\\"\"" 18)
+    true
+    (d:view "\"\\n\\t\\b\\f\\r\\/\\\\\\\"\"|" 19)))
+
+(t:test invalid-empty-document
+  (check-parse (d:view "" 0) false (d:view "" 0)))
+
+(t:test invalid-whitespace-only
+  (check-parse (d:view " " 1) false (d:view "" 0)))
+
+(t:test invalid-leading-zero
+  (check-parse (d:view "01" 2) false (d:view "" 0)))
+
+(t:test invalid-sign-only
+  (check-parse (d:view "-" 1) false (d:view "" 0)))
+
+(t:test invalid-leading-plus
+  (check-parse (d:view "+1" 2) false (d:view "" 0)))
+
+(t:test invalid-missing-fraction
+  (check-parse (d:view "1." 2) false (d:view "" 0)))
+
+(t:test invalid-missing-exponent
+  (check-parse (d:view "1e" 2) false (d:view "" 0)))
+
+(t:test invalid-exponent-sign-only
+  (check-parse (d:view "1e+" 3) false (d:view "" 0)))
+
+(t:test invalid-array-trailing-comma
+  (check-parse (d:view "[1,]" 4) false (d:view "" 0)))
+
+(t:test invalid-object-trailing-comma
+  (check-parse (d:view "{\"a\":1,}" 8) false (d:view "" 0)))
+
+(t:test invalid-unquoted-key
+  (check-parse (d:view "{a:1}" 5) false (d:view "" 0)))
+
+(t:test invalid-missing-colon
+  (check-parse (d:view "{\"a\" 1}" 7) false (d:view "" 0)))
+
+(t:test invalid-missing-comma
+  (check-parse (d:view "[1 2]" 5) false (d:view "" 0)))
+
+(t:test invalid-multiple-roots
+  (check-parse (d:view "true false" 10) false (d:view "" 0)))
+
+(t:test invalid-literal-suffix
+  (check-parse (d:view "nullx" 5) false (d:view "" 0)))
+
+(t:test invalid-unterminated-string
+  (check-parse (d:view "\"unterminated" 13) false (d:view "" 0)))
+
+(t:test invalid-unknown-escape
+  (check-parse (d:view "\"\\q\"" 4) false (d:view "" 0)))
+
+(t:test invalid-invalid-hex
+  (check-parse (d:view "\"\\uZZZZ\"" 8) false (d:view "" 0)))
+
+(t:test invalid-unpaired-high-surrogate
+  (check-parse (d:view "\"\\uD800\"" 8) false (d:view "" 0)))
+
+(t:test invalid-unpaired-low-surrogate
+  (check-parse (d:view "\"\\uDC00\"" 8) false (d:view "" 0)))
+
+(t:test invalid-invalid-surrogate-pair
+  (check-parse (d:view "\"\\uD800\\u0041\"" 14) false (d:view "" 0)))
+
+(t:test invalid-raw-control-character
+  (check-parse (d:view "\"a\nb\"" 5) false (d:view "" 0)))
+
+(t:test invalid-depth-limit
+  (check-parse
+    (d:view
+      "[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]"
+      258)
+    false
+    (d:view "" 0)))
+
+(t:test invalid-utf8
+  (let ((byte u8 255)) (check-parse (d:view (address-of byte) 1) false (d:view "" 0))))
+
+(t:test writer
+  (let
+    ((fixture-3 (array u8 5) (array-of #\a #\newline #\" 195 169))
+     (fixture-4 (array u8 13) (array-of #\" #\a #\\ #\u #\0 #\0 #\0 #\a #\\ #\" 195 169 #\")))
+    (let
+      ((owner arena:arena (arena:create (system:create) 64))
+       (out d:data (d:empty (arena:allocator (address-of owner))))
+       (status
+         e:status
+         (f:write-string (d:view (address-of (index fixture-3 0)) 5) (address-of out)))
+       (checks
+         t:result
+         (t:checks
+           (t:check (ok status))
+           (t:check (d:equal (d:borrow out) (d:view (address-of (index fixture-4 0)) 13))))))
+      (do (d:destroy (address-of out)) (arena:destroy (address-of owner)) checks))))
+
+(t:test writer-allocation-failure
+  (do
+    (assign budget 1000)
+    (let ((out d:data (d:empty (backend))) (seed e:status (d:append (address-of out) #\x)))
+      (do
+        (assign budget 0)
+        (let
+          ((status
+             e:status
+             (f:write-string
+               (d:view "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" 40)
+               (address-of out)))
+           (checks
+             t:result
+             (t:checks
+               (t:check (match status ((allocation-error _) true) (_ false)))
+               (t:check (d:equal (d:borrow out) (d:view "x" 1))))))
+          (do
+            (d:destroy (address-of out))
+            (assign budget 1000000)
+            (t:checks checks (t:check (== live 0)))))))))
+
+(base:function token-code ((kind f:token)) u64
+  (match kind
+    ((null) 1)
+    ((boolean) 2)
+    ((number) 3)
+    ((string) 4)
+    ((key) 5)
+    ((begin-array) 6)
+    ((end-array) 7)
+    ((begin-object) 8)
+    ((end-object) 9)))
+
+(base:function kinds ((context (pointer void)) (kind f:token) (source d:view)) unit
+  (let ((out (pointer d:data) (cast (pointer d:data) context)))
+    (do (d:append out (base:convert (+ (token-code kind) (char-code #\0)))) unit)))
+
+(t:test token-kinds
+  (let
+    ((captured d:data (d:empty (system:create)))
+     (parsed
+       f:result
+       (f:parse
+         (d:view "{\"x\":[null,true,1,\"s\"]}" 23)
+         (f:visitor (cast (pointer void) (address-of captured)) kinds)))
+     (checks
+       t:result
+       (t:checks
+         (t:check (ok (field parsed status)))
+         (t:check (d:equal (d:borrow captured) (d:view "856123479" 9))))))
+    (do (d:destroy (address-of captured)) checks)))
+
+(t:test exact-error-offset
+  (let
+    ((captured d:data (d:empty (system:create)))
+     (parsed
+       f:result
+       (f:parse (d:view "[1,]" 4) (f:visitor (cast (pointer void) (address-of captured)) emit))))
+    (do (d:destroy (address-of captured)) (t:check (== (field parsed offset) 3)))))
+
+(t:runner main
+  (token-kinds)
+  (exact-error-offset)
+  (valid-null)
+  (valid-whitespace)
+  (valid-false-literal)
+  (valid-large-number-lexeme)
+  (valid-fraction-exponent)
+  (valid-empty-array)
+  (valid-empty-object)
+  (valid-nested-object-unicode)
+  (valid-surrogate-pair)
+  (valid-all-escapes)
+  (invalid-empty-document)
+  (invalid-whitespace-only)
+  (invalid-leading-zero)
+  (invalid-sign-only)
+  (invalid-leading-plus)
+  (invalid-missing-fraction)
+  (invalid-missing-exponent)
+  (invalid-exponent-sign-only)
+  (invalid-array-trailing-comma)
+  (invalid-object-trailing-comma)
+  (invalid-unquoted-key)
+  (invalid-missing-colon)
+  (invalid-missing-comma)
+  (invalid-multiple-roots)
+  (invalid-literal-suffix)
+  (invalid-unterminated-string)
+  (invalid-unknown-escape)
+  (invalid-invalid-hex)
+  (invalid-unpaired-high-surrogate)
+  (invalid-unpaired-low-surrogate)
+  (invalid-invalid-surrogate-pair)
+  (invalid-raw-control-character)
+  (invalid-depth-limit)
+  (invalid-utf8)
+  (writer)
+  (writer-allocation-failure))
